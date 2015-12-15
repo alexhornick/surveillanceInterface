@@ -1,0 +1,1012 @@
+#include "player.h"
+
+#include "playlistmodel.h"
+#include "histogramwidget.h"
+#include "info.h"
+#include <iostream>
+
+#include <QMediaService>
+#include <QMediaPlaylist>
+#include <QVideoProbe>
+#include <QMediaMetaData>
+#include <QtWidgets>
+#include <QFont>
+#include <QPixmap>
+#include <ctime>
+#include <QDateTime>
+#include <fstream>
+#include <iostream>
+#include <QLineEdit>
+
+
+int orderClickedOverall=0;
+
+Player::Player(QWidget *parent)
+    : QWidget(parent)
+    , coverLabel(0)
+    , slider(0)
+#ifndef PLAYER_NO_COLOROPTIONS
+    , colorDialog(0)
+#endif
+{
+    setFocusPolicy(Qt::StrongFocus);
+
+//! [create-objs]
+    player = new QMediaPlayer(this);
+    // owned by PlaylistModel
+    playlist = new QMediaPlaylist();
+    player->setPlaylist(playlist);
+//! [create-objs]
+
+    connect(player, SIGNAL(durationChanged(qint64)), SLOT(durationChanged(qint64)));
+    connect(player, SIGNAL(positionChanged(qint64)), SLOT(positionChanged(qint64)));
+    connect(player, SIGNAL(metaDataChanged()), SLOT(metaDataChanged()));
+    connect(playlist, SIGNAL(currentIndexChanged(int)), SLOT(clearCheckboxes()));
+    connect(player, SIGNAL(mediaStatusChanged(QMediaPlayer::MediaStatus)),
+            this, SLOT(statusChanged(QMediaPlayer::MediaStatus)));
+    connect(player, SIGNAL(bufferStatusChanged(int)), this, SLOT(bufferingProgress(int)));
+    connect(player, SIGNAL(videoAvailableChanged(bool)), this, SLOT(videoAvailableChanged(bool)));
+    connect(player, SIGNAL(error(QMediaPlayer::Error)), this, SLOT(displayErrorMessage()));
+    connect(player, SIGNAL(stateChanged(QMediaPlayer::State)), this, SLOT(setState(QMediaPlayer::State)));
+
+//! [2]
+    playerState = QMediaPlayer::StoppedState;
+    videoWidget = new QVideoWidget();
+    player->setVideoOutput(videoWidget);
+    videoWidget->setFocus();
+
+    //qApp->setStyleSheet(QString("QWidget{background-color:#EED2EE;  }"));
+    //qApp->setStyleSheet(QString("QWidget{background-color:#FFD2E8;}"));
+    qApp->setStyleSheet(QString("QWidget{background-color:#F8F8FF;}"));
+    QFont appFont("Myriad Pro");
+    qApp->setFont(appFont);
+    slider = new QSlider;
+    slider->setFocusProxy(videoWidget);
+    slider->setRange(0, player->duration() / 1000);
+    slider->setOrientation(Qt::Horizontal);
+
+    labelDuration = new QLabel(this);
+    labelDuration->setFocusProxy(videoWidget);
+    connect(slider, SIGNAL(sliderMoved(int)), this, SLOT(seek(int)));
+
+    histogram = new HistogramWidget(this);
+
+    probe = new QVideoProbe(this);
+    connect(probe, SIGNAL(videoFrameProbed(QVideoFrame)), histogram, SLOT(processFrame(QVideoFrame)));
+    probe->setSource(player);
+
+    openButton = new QPushButton(tr("Open"), this);
+    connect(openButton, SIGNAL(clicked()), this, SLOT(open()));
+    connect(openButton, SIGNAL(clicked()), this, SLOT(inputParNum()));
+    connect(openButton, SIGNAL(clicked()), this, SLOT(clickReady()));
+    openButton->setStyleSheet("background-color:white;");
+
+    playButton = new QToolButton(this);
+    playButton -> setIcon(style() -> standardIcon(QStyle::SP_MediaPlay));
+    connect(playButton, SIGNAL(clicked()), this, SLOT(playClicked()));
+    playButton->setStyleSheet("background-color:white;");
+
+    connect(this, SIGNAL(playVideo()), player, SLOT(play()));
+    connect(this, SIGNAL(pauseVideo()), player, SLOT(pause()));
+
+    stopButton = new QToolButton(this);
+    stopButton->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
+    stopButton->setEnabled(false);
+    stopButton->setStyleSheet("background-color:white;");
+
+    connect(stopButton, SIGNAL(clicked()), player, SLOT(stop()));
+    connect(stopButton, SIGNAL(clicked()), videoWidget, SLOT(update()));
+
+    nextButton = new QToolButton(this);
+    nextButton->setIcon(style()->standardIcon(QStyle::SP_MediaSkipForward));
+    nextButton->setStyleSheet("background-color:white;");
+    //connect(nextButton, SIGNAL(clicked()), playlist, SLOT(next()));
+    connect(nextButton, SIGNAL(clicked()), this, SLOT(nextVideo()));
+    connect(this, SIGNAL(goToNext()), playlist, SLOT(next()));
+
+    previousButton = new QToolButton(this);
+    previousButton->setIcon(style()->standardIcon(QStyle::SP_MediaSkipBackward));
+    previousButton->setStyleSheet("background-color:white;");
+
+    connect(previousButton, SIGNAL(clicked()), this, SLOT(previousClicked()));
+
+    muteButton = new QToolButton(this);
+    muteButton->setIcon(style()->standardIcon(QStyle::SP_MediaVolume));
+    muteButton->setStyleSheet("background-color:white;");
+
+    connect(muteButton, SIGNAL(clicked()), this, SLOT(muteClicked()));
+    connect(this, SIGNAL(changeMuting(bool)), player, SLOT(setMuted(bool)));
+
+    volumeSlider = new QSlider(Qt::Horizontal, this);
+    volumeSlider->setRange(0, 100);
+
+    connect(volumeSlider, SIGNAL(sliderMoved(int)), player, SLOT(setVolume(int)));
+
+    rateBox = new QComboBox(this);
+    rateBox->setFocusProxy(videoWidget);
+    rateBox->addItem("0.5x", QVariant(0.5));
+    rateBox->addItem("1.0x", QVariant(1.0));
+    rateBox->addItem("2.0x", QVariant(2.0));
+    rateBox->setCurrentIndex(1);
+    rateBox->setStyleSheet("background-color:white;");
+
+    connect(rateBox, SIGNAL(activated(int)), SLOT(updateRate()));
+    connect(this, SIGNAL(changeRate(qreal)), player, SLOT(setPlaybackRate(qreal)));
+
+    QTimer *timer2 = new QTimer(this);
+    QDateTime originalTime = QDateTime::currentDateTime();
+    QString Time = originalTime.toString(QString::fromStdString("hh:mm:ss AP    MM/dd"));
+    showTime = new QLabel(Time);
+    showTime->setFocusProxy(videoWidget);
+    QFont q("Myriad Pro", 16);
+    showTime->setFont(q);
+    showTime->setAlignment(Qt::AlignRight);
+    //showTime->setStyleSheet("text-align:right;");
+    connect(timer2, SIGNAL(timeout()), this, SLOT(updateTime()));
+    timer2->start(1000);
+
+    tabs = new QTreeWidget();
+    tabs->setFocusProxy(videoWidget);
+    QFont treeFont("Myriad Pro", 17);
+    tabs->setHeaderLabel(QString("Body Parts"));
+    tabs->setHeaderHidden(true);
+    tabs->verticalScrollBar()->setMinimumWidth(3);
+    tabs->verticalScrollBar()->setHidden(true);
+    for (int i = 0; i <= database.bodyparts.size() - 1; i++) {
+        QTreeWidgetItem *part = new QTreeWidgetItem(0);
+        part->setText(0, QString::fromStdString(database.bodyparts.at(i).name));
+        part->setFont(0,treeFont);
+        tabs->setStyleSheet("QTreeWidget::Item { padding: 4px; }");
+        tabs->addTopLevelItem(part);
+        if (!database.bodyparts.at(i).bilateral) {
+            for (int j = 0; j < database.bodyparts.at(i).data.size(); j++) {
+                QTreeWidgetItem *character = new QTreeWidgetItem(0);
+                character->setText(0, QString::fromStdString(database.bodyparts.at(i).data.at(j)));
+                character->setFlags(character->flags() | Qt::ItemIsUserCheckable);
+                character->setCheckState(0, Qt::Unchecked);
+                part->addChild(character);
+                boxes.push_back(character);
+            }
+
+        } else {
+            for (int j = 0; j < database.bodyparts.at(i).data.size(); j++) {
+                QTreeWidgetItem *character = new QTreeWidgetItem(0);
+                character->setText(0, QString::fromStdString(database.bodyparts.at(i).data.at(j)));
+                QTreeWidgetItem *left = new QTreeWidgetItem(0);
+                QTreeWidgetItem *right = new QTreeWidgetItem(0);
+                QTreeWidgetItem *both = new QTreeWidgetItem(0);
+                left->setText(0, "Left");
+                right->setText(0, "Right");
+                both->setText(0, "Both");
+                left->setFlags(left->flags() | Qt::ItemIsUserCheckable);
+                right->setFlags(right->flags() | Qt::ItemIsUserCheckable);
+                both->setFlags(both->flags() | Qt::ItemIsUserCheckable);
+                left->setCheckState(0, Qt::Unchecked);
+                right->setCheckState(0, Qt::Unchecked);
+                both->setCheckState(0, Qt::Unchecked);
+                character->addChild(left);
+                character->addChild(right);
+                character->addChild(both);
+                boxes.push_back(left);
+                boxes.push_back(right);
+                boxes.push_back(both);
+                part->addChild(character);
+            }
+        }
+        QTreeWidgetItem *other = new QTreeWidgetItem(0);
+        part->addChild(other);
+        QLineEdit *line = new QLineEdit(tabs);
+        line->setPlaceholderText("Type other comment here");
+        tabs->setItemWidget(other,0,line);
+        comment.push_back(other);
+    }
+
+    tabs->setStyleSheet(QString("width:150px;padding:5px;"));
+    connect(tabs, SIGNAL(itemClicked(QTreeWidgetItem*, int)), this, SLOT(needStop()));
+    connect(this, SIGNAL(updateInfo()), this, SLOT(submitCheckboxes()));
+    connect(this, SIGNAL(updateInfo()), tabs, SLOT(collapseAll()));
+    connect(this, SIGNAL(updateInfo()), this, SLOT(clearCheckboxes()));
+
+    screenshotButton = new QPushButton(tr("Screen Shot"), this);
+    screenshotButton->setFocusProxy(videoWidget);
+    screenshotButton->setStyleSheet(QString("background-color: #99cc99"));
+    connect(screenshotButton, SIGNAL(clicked()), this, SLOT(saveScreenshot()));
+    alertButton = new QPushButton(tr("Alert Officer"), this);
+    alertButton->setFocusProxy(videoWidget);
+    alertButton->setStyleSheet(QString("background-color: #FF6666"));
+
+    tutorialButton = new QPushButton(tr("Tutorial"), this);
+    connect(tutorialButton, SIGNAL(clicked()), this, SLOT(tutorial()));
+    tutorialButton->setStyleSheet("background-color:white;");
+#ifndef PLAYER_NO_COLOROPTIONS
+    colorButton = new QPushButton(tr("Color Options..."), this);
+    colorButton->setFocusProxy(videoWidget);
+    colorButton->setEnabled(false);
+    connect(colorButton, SIGNAL(clicked()), this, SLOT(showColorDialog()));
+    colorButton->setStyleSheet("background-color:white;");
+#endif
+
+    QBoxLayout *rightLayout = new QVBoxLayout;
+    rightLayout->addWidget(showTime);
+    rightLayout->addWidget(tabs);
+    rightLayout->addWidget(screenshotButton);
+    rightLayout->addWidget(alertButton);
+
+    QBoxLayout *displayLayout = new QHBoxLayout;
+    displayLayout->addWidget(videoWidget, 2);
+    displayLayout->addLayout(rightLayout);
+
+    QBoxLayout *controlLayout = new QHBoxLayout;
+    controlLayout->setMargin(0);
+    controlLayout->addWidget(openButton);
+    controlLayout->addWidget(tutorialButton);
+    controlLayout->addStretch(1);
+    controlLayout->addWidget(stopButton);
+    controlLayout->addWidget(previousButton);
+    controlLayout->addWidget(playButton);
+    controlLayout->addWidget(nextButton);
+    controlLayout->addWidget(muteButton);
+    controlLayout->addWidget(volumeSlider);
+    controlLayout->addWidget(rateBox);
+    controlLayout->addStretch(1);
+#ifndef PLAYER_NO_COLOROPTIONS
+    controlLayout->addWidget(colorButton);
+#endif
+
+    QBoxLayout *layout = new QVBoxLayout;
+    layout->addLayout(displayLayout);
+    QHBoxLayout *hLayout = new QHBoxLayout;
+    hLayout->addWidget(slider);
+    hLayout->addWidget(labelDuration);
+    layout->addLayout(hLayout);
+    layout->addLayout(controlLayout);
+
+    setLayout(layout);
+
+    if (!player->isAvailable()) {
+        QMessageBox::warning(this, tr("Service not available"),
+                             tr("The QMediaPlayer object does not have a valid service.\n"\
+                                "Please check the media service plugins are installed."));
+
+        openButton->setEnabled(false);
+#ifndef PLAYER_NO_COLOROPTIONS
+        colorButton->setEnabled(false);
+#endif
+    }
+
+    metaDataChanged();
+
+    QStringList arguments = qApp->arguments();
+    arguments.removeAt(0);
+    addToPlaylist(arguments);
+
+     //addToPlaylist(QStringList("C:\Users\Public\Videos\Sample Videos"));
+}
+
+Player::~Player()
+{
+
+}
+
+void Player::open()
+{
+    QStringList fileNames = QFileDialog::getOpenFileNames(this, tr("Open Files"));
+    if (!fileNames.isEmpty()) {
+        fileNames.sort();
+        std::vector<QString> fileNamesCopy;
+        for (int i = 1; i < fileNames.size(); i++) {
+            fileNamesCopy.push_back(fileNames.at(i));
+        }
+        std::srand(std::time(0));
+        std::random_shuffle(fileNamesCopy.begin(), fileNamesCopy.end());
+        QStringList finalFileNames;
+        finalFileNames.push_back(fileNames.at(0));
+        for (int i = 0; i < fileNamesCopy.size(); i++) {
+            finalFileNames.push_back(fileNamesCopy.at(i));
+        }
+        addToPlaylist(finalFileNames);
+    }
+}
+
+void Player::beginSurvey() {
+    string postMessage;
+    if (playlist->currentMedia().canonicalUrl().url().toStdString().find("Green") != -1) {
+        postMessage = "\n\nTarget is wearing a blue shirt. ";
+    } else if (playlist->currentMedia().canonicalUrl().url().toStdString().find("Orange") != -1) {
+        postMessage = "\n\nTarget is wearing a black shirt with an orange logo on the front. ";
+    }
+    QMessageBox msgBox;
+    QString message = QString::fromStdString("Video " + std::to_string(playlist->currentIndex() + 1) + " is about to begin! " + postMessage);
+    msgBox.setText(message);
+
+    msgBox.setStyleSheet("text-align:center; font-size:16pt; ");
+
+
+    msgBox.exec();
+}
+
+void Player::endSurvey() {
+    QMessageBox msgBox;
+    QString message = QString::fromStdString("<p>Do you think this person is concealing a weapon?</p>");
+    msgBox.setText(message);
+    QString buttonYes = QString::fromStdString("Yes");
+    QString buttonNo = QString::fromStdString("No");
+    QRadioButton *concealingWeapon = new QRadioButton(buttonYes);
+    QRadioButton *notConcealingWeapon = new QRadioButton(buttonNo);
+    concealingWeapon->setStyleSheet("font-size:18pt;");
+    notConcealingWeapon->setStyleSheet("font-size:18pt;");
+
+
+    msgBox.setStyleSheet("width:90px; height:50px; text-align:center; font-size:14pt;  padding:8px; margin:8px;");
+
+
+    msgBox.addButton(concealingWeapon, QMessageBox::YesRole);
+    msgBox.addButton(notConcealingWeapon, QMessageBox::NoRole);
+    //msgBox.setLayout(hLayout);
+    msgBox.exec();
+    QMessageBox msgBox2;
+    QString message2;
+    database.addVideoName3((playlist->currentMedia().canonicalUrl().url().toStdString()));
+    database.addToSequencePlayed3(std::to_string(playlist->currentIndex()+1));
+    if (concealingWeapon->isChecked()) {
+        database.setConcealing(true);
+        message2 = QString::fromStdString("What's your confidence level on 50 to 100 scale that this person is concealing a weapon?");
+    } else {
+        database.setConcealing(false);
+        message2 = QString::fromStdString("What's your confidence level on 50 to 100 scale that this person is not concealing a weapon?");
+    }
+    msgBox2.setText(message2);
+    QRadioButton *b50 = new QRadioButton("50%");
+    QRadioButton *b60 = new QRadioButton("60%");
+    QRadioButton *b70 = new QRadioButton("70%");
+    QRadioButton *b80 = new QRadioButton("80%");
+    QRadioButton *b90 = new QRadioButton("90%");
+    QRadioButton *b100 = new QRadioButton("100%");
+    msgBox2.addButton(b50, QMessageBox::YesRole);
+    msgBox2.addButton(b60, QMessageBox::YesRole);
+    msgBox2.addButton(b70, QMessageBox::YesRole);
+    msgBox2.addButton(b80, QMessageBox::YesRole);
+    msgBox2.addButton(b90, QMessageBox::YesRole);
+    msgBox2.addButton(b100, QMessageBox::NoRole);
+
+    msgBox2.setStyleSheet("width:200px; height:150px; text-align:center; font-size:16pt; padding:8px; margin:8px;");
+
+    msgBox2.exec();
+    int p = 0;
+    if (b50->isChecked()) {
+        p = 50;
+    } else if (b60->isChecked()) {
+        p = 60;
+    } else if (b70->isChecked()) {
+        p = 70;
+    } else if (b80->isChecked()) {
+        p = 80;
+    } else if (b90->isChecked()) {
+        p = 90;
+    } else if (b100->isChecked()) {
+        p = 100;
+    }
+    database.setProbability(p);
+
+
+}
+
+void Player::needStop() {
+    emit pauseVideo();
+}
+
+void Player::linkSurvey() {
+    QMessageBox msgBox;
+    msgBox.setTextFormat(Qt::RichText);
+    msgBox.setText("You have completed all videos. Thank you for your participation. Please click <a href='https://iastate.qualtrics.com/SE/?SID=SV_0k4jkHp2nWPEmPP'>here</a> to complete a usability survey.\n\n");
+    msgBox.setStyleSheet("font-size:14pt;");
+    msgBox.exec();
+}
+
+
+void Player::addToPlaylist(const QStringList& fileNames)
+{
+    foreach (QString const &argument, fileNames) {
+        QFileInfo fileInfo(argument);
+        if (fileInfo.exists()) {
+            QUrl url = QUrl::fromLocalFile(fileInfo.absoluteFilePath());
+            if (fileInfo.suffix().toLower() == QLatin1String("m3u")) {
+                playlist->load(url);
+            } else
+                playlist->addMedia(url);
+        } else {
+            QUrl url(argument);
+            if (url.isValid()) {
+                playlist->addMedia(url);
+            }
+        }
+    }
+}
+
+void Player::durationChanged(qint64 duration)
+{
+    this->duration = duration/1000;
+    slider->setMaximum(duration / 1000);
+}
+
+void Player::positionChanged(qint64 progress)
+{
+    if (!slider->isSliderDown()) {
+        slider->setValue(progress / 1000);
+    }
+    updateDurationInfo(progress / 1000);
+}
+
+void Player::metaDataChanged()
+{
+    if (player->isMetaDataAvailable()) {
+        setTrackInfo(QString("%1 - %2")
+                .arg(player->metaData(QMediaMetaData::AlbumArtist).toString())
+                .arg(player->metaData(QMediaMetaData::Title).toString()));
+
+        if (coverLabel) {
+            QUrl url = player->metaData(QMediaMetaData::CoverArtUrlLarge).value<QUrl>();
+
+            coverLabel->setPixmap(!url.isEmpty()
+                    ? QPixmap(url.toString())
+                    : QPixmap());
+        }
+    }
+}
+
+void Player::previousClicked()
+{
+    // Go to previous track if we are within the first 5 seconds of playback
+    // Otherwise, seek to the beginning.
+    if(player->position() <= 5000)
+        playlist->previous();
+    else
+        player->setPosition(0);
+}
+
+void Player::muteClicked()
+{
+    if (player->isMuted()) {
+        emit changeMuting(false);
+    } else {
+        emit changeMuting(true);
+    }
+}
+
+void Player::jump(const QModelIndex &index)
+{
+    if (index.isValid()) {
+        playlist->setCurrentIndex(index.row());
+        player->play();
+    }
+}
+
+void Player::seek(int seconds)
+{
+    player->setPosition(seconds * 1000);
+}
+
+void Player::statusChanged(QMediaPlayer::MediaStatus status)
+{
+    handleCursor(status);
+
+    // handle status message
+    switch (status) {
+    case QMediaPlayer::UnknownMediaStatus:
+    case QMediaPlayer::NoMedia:
+    case QMediaPlayer::LoadedMedia:
+    case QMediaPlayer::BufferingMedia:
+    case QMediaPlayer::BufferedMedia:
+        setStatusInfo(QString());
+        break;
+    case QMediaPlayer::LoadingMedia:
+        setStatusInfo(tr("Loading..."));
+        beginSurvey();
+        break;
+    case QMediaPlayer::StalledMedia:
+        setStatusInfo(tr("Media Stalled"));
+        break;
+    case QMediaPlayer::EndOfMedia:
+        endSurvey();
+        if(playlist->currentIndex()+1 == playlist->mediaCount())
+        {
+            database.writeData();
+            linkSurvey();
+            playlist->clear();
+        }
+
+        orderClickedOverall = 0;
+
+        QApplication::alert(this);
+
+        break;
+    case QMediaPlayer::InvalidMedia:
+        displayErrorMessage();
+        break;
+    }
+}
+
+void Player::playClicked()
+{
+    switch (player->state()) {
+    case QMediaPlayer::StoppedState:
+    case QMediaPlayer::PausedState:
+        emit updateInfo();
+        emit playVideo();
+        break;
+    case QMediaPlayer::PlayingState:
+        emit pauseVideo();
+        break;
+    }
+}
+
+qreal Player::playbackRate() const
+{
+    return rateBox->itemData(rateBox->currentIndex()).toDouble();
+}
+
+void Player::setPlaybackRate(float rate)
+{
+    for (int i = 0; i < rateBox->count(); ++i) {
+        if (qFuzzyCompare(rate, float(rateBox->itemData(i).toDouble()))) {
+            rateBox->setCurrentIndex(i);
+            return;
+        }
+    }
+
+    rateBox->addItem(QString("%1x").arg(rate), QVariant(rate));
+    rateBox->setCurrentIndex(rateBox->count() - 1);
+}
+
+void Player::updateRate()
+{
+    emit changeRate(playbackRate());
+}
+
+void Player::handleCursor(QMediaPlayer::MediaStatus status)
+{
+#ifndef QT_NO_CURSOR
+    if (status == QMediaPlayer::LoadingMedia ||
+        status == QMediaPlayer::BufferingMedia ||
+        status == QMediaPlayer::StalledMedia)
+        setCursor(QCursor(Qt::BusyCursor));
+    else
+        unsetCursor();
+#endif
+}
+
+void Player::bufferingProgress(int progress)
+{
+    setStatusInfo(tr("Buffering %4%").arg(progress));
+}
+
+void Player::videoAvailableChanged(bool available)
+{
+#ifndef PLAYER_NO_COLOROPTIONS
+    colorButton->setEnabled(available);
+#endif
+}
+
+void Player::setState(QMediaPlayer::State state)
+{
+    if (state != playerState) {
+        playerState = state;
+
+        switch (state) {
+        case QMediaPlayer::StoppedState:
+            stopButton->setEnabled(false);
+            playButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+            break;
+        case QMediaPlayer::PlayingState:
+            stopButton->setEnabled(true);
+            playButton->setIcon(style()->standardIcon(QStyle::SP_MediaPause));
+            break;
+        case QMediaPlayer::PausedState:
+            stopButton->setEnabled(true);
+            playButton->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+            break;
+        }
+    }
+}
+
+void Player::setTrackInfo(const QString &info)
+{
+    trackInfo = info;
+    if (!statusInfo.isEmpty())
+        setWindowTitle(QString("%1 | %2").arg(trackInfo).arg(statusInfo));
+    else
+        setWindowTitle(trackInfo);
+}
+
+void Player::setStatusInfo(const QString &info)
+{
+    statusInfo = info;
+    if (!statusInfo.isEmpty())
+        setWindowTitle(QString("%1 | %2").arg(trackInfo).arg(statusInfo));
+    else
+        setWindowTitle(trackInfo);
+}
+
+void Player::displayErrorMessage()
+{
+    setStatusInfo(player->errorString());
+}
+
+void Player::updateDurationInfo(qint64 currentInfo)
+{
+    QString tStr;
+    if (currentInfo || duration) {
+        QTime currentTime((currentInfo/3600)%60, (currentInfo/60)%60, currentInfo%60, (currentInfo*1000)%1000);
+        QTime totalTime((duration/3600)%60, (duration/60)%60, duration%60, (duration*1000)%1000);
+        QString format = "mm:ss";
+        if (duration > 3600)
+            format = "hh:mm:ss";
+        tStr = currentTime.toString(format) + " / " + totalTime.toString(format);
+    }
+    labelDuration->setText(tStr);
+}
+
+void Player::clearCheckboxes() {
+    for (int i = 0; i < boxes.size(); i++) {
+        boxes.at(i) -> setCheckState(0, Qt::Unchecked);
+    }
+    for (int i = 0; i < comment.size(); i++) {
+        //comment.at(i) ->setText(0, QString::fromStdString("Other comment (Double Click)"));
+        QLineEdit *line = new QLineEdit(tabs);
+        line->setPlaceholderText("Type other comment here");
+        tabs->setItemWidget(comment.at(i),0,line);
+    }
+}
+
+
+
+void Player::submitCheckboxes() {
+    int orderChecked = 0;
+    for (int i = 0; i < boxes.size(); i++) {
+        if (boxes.at(i)->checkState(0) == Qt::Checked) {
+            orderChecked++;
+            orderClickedOverall++;
+            qint64 currentInfo = (player->position())/1000;
+            int hours = currentInfo/3600;
+            int minutes = (currentInfo - hours * 3600) / 60;
+            int seconds = currentInfo - hours * 3600 - minutes * 60;
+            string currentTime;
+            string hour = to_string(hours);
+            string minute = to_string(minutes);
+            string second = to_string(seconds);
+            if (hour.size()==1) {
+                hour = "0" + hour;
+            }
+            if (minute.size()==1) {
+                minute = "0" + minute;
+            }
+            if (second.size()==1) {
+                second = "0" + second;
+            }
+            if (hours == 0) {
+                currentTime = minute + ":" + second;
+            } else {
+                currentTime = hour + ":" + minute + ":" + second;
+            }
+            int bodyNum = 0;
+            string title;
+            database.addVideoName((playlist->currentMedia().canonicalUrl().url().toStdString()));
+            database.addToTimestamp(currentTime);
+            int cut = ((showTime->text()).toStdString()).find("   ");
+            string substring = ((showTime->text()).toStdString()).substr(0, cut);
+            database.addToRealTime1(substring);
+            QString checked;
+            string code;
+            QTreeWidgetItem * p;
+            QTreeWidgetItem * ch;
+            if (((boxes.at(i)->text(0)).compare(QString("Left"), Qt::CaseSensitive) == 0) | ((boxes.at(i)->text(0)).compare(QString("Right"), Qt::CaseSensitive) == 0) | ((boxes.at(i)->text(0)).compare(QString("Both"), Qt::CaseSensitive) == 0)) {
+                p = ((boxes.at(i)->parent())->parent());
+                ch = (boxes.at(i)->parent());
+                checked = ((boxes.at(i)->parent())->parent())->text(0) + ", " + (boxes.at(i)->parent())->text(0) + (boxes.at(i))->text(0);
+                title = (((boxes.at(i)->parent())->parent())->text(0)).toStdString();
+            } else {
+                p = (boxes.at(i)->parent());
+                ch = boxes.at(i);
+                checked = (boxes.at(i)->parent())->text(0) + ", " + boxes.at(i)->text(0);
+                title = ((boxes.at(i)->parent())->text(0)).toStdString();
+            }
+            if(title.compare("Head")==0) {
+                bodyNum = 50;
+                code = "HE5";
+            }
+            else if(title.compare("Shoulders")==0) {
+                bodyNum = 30;
+                code = "SH3";
+            }
+            else if(title.compare("Arms")==0) {
+                bodyNum = 10;
+                code = "AR1";
+            }
+            else if(title.compare("Torso")==0) {
+                bodyNum = 40;
+                code = "TO4";
+            }
+            else if(title.compare("Legs/Gait")==0) {
+                bodyNum = 20;
+                code = "LE2";
+            }
+            else if(title.compare("Demeanor")==0) {
+                bodyNum = 60;
+                code = "DE6";
+            }
+            database.addToChecked(checked.toStdString());
+            database.addCharNum(code + std::to_string(p->indexOfChild(ch)+1));
+            database.addOrderClicks(std::to_string(orderChecked));
+            database.addToSequencePlayed(std::to_string(playlist->currentIndex()+1));
+            database.addToOrderCheckedTotal(std::to_string(orderClickedOverall)); 
+            database.addBodyPartNum(std::to_string(bodyNum));
+        }
+    }
+    for (int i = 0; i < comment.size(); i++) {
+        if ((((QLineEdit *)(tabs->itemWidget(comment.at(i), 0)))->text()).compare("") != 0) {
+            orderChecked++;
+            orderClickedOverall++;
+            qint64 currentInfo = (player->position())/1000;
+            int hours = currentInfo/3600;
+            int minutes = (currentInfo - hours * 3600) / 60;
+            int seconds = currentInfo - hours * 3600 - minutes * 60;
+            string currentTime;
+            string hour = to_string(hours);
+            string minute = to_string(minutes);
+            string second = to_string(seconds);
+            if (hour.size()==1) {
+                hour = "0" + hour;
+            }
+            if (minute.size()==1) {
+                minute = "0" + minute;
+            }
+            if (second.size()==1) {
+                second = "0" + second;
+            }
+            if (hours == 0) {
+                currentTime = minute + ":" + second;
+            } else {
+                currentTime = hour + ":" + minute + ":" + second;
+            }
+            database.addVideoName((playlist->currentMedia().canonicalUrl().url().toStdString()));
+            int cut = ((showTime->text()).toStdString()).find("   ");
+            string substring = ((showTime->text()).toStdString()).substr(0, cut);
+            database.addToRealTime1(substring);
+            database.addToTimestamp(currentTime);
+            database.addToChecked(((comment.at(i)->parent())->text(0) + ", " + (((QLineEdit *)(tabs->itemWidget(comment.at(i), 0)))->text())).toStdString());
+            database.addOrderClicks(std::to_string(orderChecked));
+            database.addToSequencePlayed(std::to_string(playlist->currentIndex()+1));
+            database.addToOrderCheckedTotal(std::to_string(orderClickedOverall));
+
+            int bodyNum = 0;   //Adding body Number to database
+            string title = ((((comment.at(i))->parent()))->text(0)).toStdString();
+            string code;
+            if(title.compare("Head")==0) {
+                bodyNum = 50;
+                code = "HE5";
+            }
+            else if(title.compare("Shoulders")==0) {
+                bodyNum = 30;
+                code = "SH3";
+            }
+            else if(title.compare("Arms")==0) {
+                bodyNum = 10;
+                code = "AR1";
+            }
+            else if(title.compare("Torso")==0) {
+                bodyNum = 40;
+                code = "TO4";
+            }
+            else if(title.compare("Legs/Gait")==0) {
+                bodyNum = 20;
+                code = "LE2";
+            }
+            else if(title.compare("Demeanor")==0) {
+                bodyNum = 60;
+                code = "DE6";
+            }
+            database.addBodyPartNum(std::to_string(bodyNum));
+            database.addCharNum(code + "9");
+        }
+    }
+}
+
+
+void Player::keyPressEvent(QKeyEvent *e) {
+    if (e->key() == Qt::Key_Escape) {
+        this->showNormal();
+    } else if (e->key() == Qt::Key_Space) {
+        emit playClicked();
+    } else if (e->key() == Qt::Key_S && QApplication::keyboardModifiers() && Qt::ControlModifier) {
+        if (database.videoName.size()!=0 || database.videoName2.size()!=0)
+            database.writeData();
+    }
+}
+
+void Player::mousePressEvent(QMouseEvent *event) {
+    int posRX = (event->globalX()) - (videoWidget->x());
+    int posRY = (event->globalY()) - (videoWidget->y());
+    if (posRX > 0 && posRX < videoWidget->width() && posRY > 0 && posRY < videoWidget->height() && (playlist->currentIndex() + 1) >= 1) {
+        qint64 currentInfo = (player->position())/1000;
+        int hours = currentInfo/3600;
+        int minutes = (currentInfo - hours * 3600) / 60;
+        int seconds = currentInfo - hours * 3600 - minutes * 60;
+        string currentTime;
+        string hour = to_string(hours);
+        string minute = to_string(minutes);
+        string second = to_string(seconds);
+        if (hour.size()==1) {
+            hour = "0" + hour;
+        }
+        if (minute.size()==1) {
+            minute = "0" + minute;
+        }
+        if (second.size()==1) {
+            second = "0" + second;
+        }
+        if (hours == 0) {
+            currentTime = minute + ":" + second;
+        } else {
+            currentTime = hour + ":" + minute + ":" + second;
+        }
+        database.addVideoName2((playlist->currentMedia().canonicalUrl().url().toStdString()));
+        int cut = ((showTime->text()).toStdString()).find("   ");
+        string substring = ((showTime->text()).toStdString()).substr(0, cut);
+        database.addToRealTime2(substring);
+        database.addToTimeLocation(currentTime);
+        database.addToClickPos(std::to_string(posRX) + ", " + std::to_string(posRY));
+        database.addToSequencePlayed2(std::to_string(playlist->currentIndex()+1));
+        emit playClicked();
+    }
+}
+
+void Player::updateTime() {
+    QDateTime originalTime = QDateTime::currentDateTime();
+    QString Time = originalTime.toString(QString::fromStdString("hh:mm:ss AP    MM/dd"));
+    showTime->setText(Time);
+}
+
+void Player::saveScreenshot() {
+    QPixmap originalPixmap;
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (screen)
+        originalPixmap = screen->grabWindow(0);
+    string fileName = "screenshot";
+    string fileExtension = "screenshot.png";
+    string extension = ".png";
+    QString format = "png";
+    int i = 1;
+    string j = std::to_string(i);
+    while(Info::is_file_exist(fileExtension))
+    {
+        j = std::to_string(i);
+        fileExtension = (fileName+j) + extension;
+        i++;
+    }
+    QString initialPath = QDir::currentPath() + tr("/") + QString::fromStdString(fileExtension);
+    originalPixmap.save(initialPath, format.toLatin1().constData());
+
+}
+
+#ifndef PLAYER_NO_COLOROPTIONS
+void Player::showColorDialog()
+{
+    if (!colorDialog) {
+        QSlider *brightnessSlider = new QSlider(Qt::Horizontal);
+        brightnessSlider->setRange(-100, 100);
+        brightnessSlider->setValue(videoWidget->brightness());
+        connect(brightnessSlider, SIGNAL(sliderMoved(int)), videoWidget, SLOT(setBrightness(int)));
+        connect(videoWidget, SIGNAL(brightnessChanged(int)), brightnessSlider, SLOT(setValue(int)));
+
+        QSlider *contrastSlider = new QSlider(Qt::Horizontal);
+        contrastSlider->setRange(-100, 100);
+        contrastSlider->setValue(videoWidget->contrast());
+        connect(contrastSlider, SIGNAL(sliderMoved(int)), videoWidget, SLOT(setContrast(int)));
+        connect(videoWidget, SIGNAL(contrastChanged(int)), contrastSlider, SLOT(setValue(int)));
+
+        QSlider *hueSlider = new QSlider(Qt::Horizontal);
+        hueSlider->setRange(-100, 100);
+        hueSlider->setValue(videoWidget->hue());
+        connect(hueSlider, SIGNAL(sliderMoved(int)), videoWidget, SLOT(setHue(int)));
+        connect(videoWidget, SIGNAL(hueChanged(int)), hueSlider, SLOT(setValue(int)));
+
+        QSlider *saturationSlider = new QSlider(Qt::Horizontal);
+        saturationSlider->setRange(-100, 100);
+        saturationSlider->setValue(videoWidget->saturation());
+        connect(saturationSlider, SIGNAL(sliderMoved(int)), videoWidget, SLOT(setSaturation(int)));
+        connect(videoWidget, SIGNAL(saturationChanged(int)), saturationSlider, SLOT(setValue(int)));
+
+        QFormLayout *layout = new QFormLayout;
+        layout->addRow(tr("Brightness"), brightnessSlider);
+        layout->addRow(tr("Contrast"), contrastSlider);
+        layout->addRow(tr("Hue"), hueSlider);
+        layout->addRow(tr("Saturation"), saturationSlider);
+
+        QPushButton *button = new QPushButton(tr("Close"));
+        layout->addRow(button);
+
+        colorDialog = new QDialog(this);
+        colorDialog->setWindowTitle(tr("Color Options"));
+        colorDialog->setLayout(layout);
+
+        connect(button, SIGNAL(clicked()), colorDialog, SLOT(close()));
+    }
+    colorDialog->show();
+}
+
+void Player::nextVideo() {
+    if ((playlist->currentIndex() + 1)!=(playlist->mediaCount())) {
+        emit goToNext();
+    } else {
+        playlist->clear();
+    }
+}
+
+void Player::inputParNum() {
+    if (!playlist->isEmpty()) {
+        QInputDialog inputNum;
+        inputNum.setInputMode(QInputDialog::IntInput);
+        inputNum.setLabelText("Please ask your instructor to input your participant number: ");
+        inputNum.exec();
+        database.addParticipantNum(inputNum.intValue());
+    }
+}
+
+void Player::tutorial()
+{
+    playClicked();
+    QPixmap pixmap("Tutorial1.png");
+    QMessageBox instructionBox0;
+    QString instruction = "Thank you for participating in the Detecting Threat study. \n\n\As part of the study, you will perfrom three tasks. \n\nTask 1: Your first task will be to view eight videos of a single individual who may or may not be concealing a firearm. As you watch each video, you will be able to stop the video and select from a list of options those behaviors that seem suspicious. \n\nTask 2:After you’ve watched the video and identified those behaviors that you think might suggest concealment of a firearm you will be asked to respond Yes or No as to whether or not you think the person in the clip was concealing a firearm. You will then be asked to rate how certain you are using a 50% - 100% scale.\n\nTask 3: Once you’ve watched all 8 videos and entered your judgments you will complete a brief survey.\n\nClick below to be taken to tutorial and practice video. ";
+    instructionBox0.setText(instruction);
+    instructionBox0.exec();
+
+    QMessageBox instructionBox1;
+    instructionBox1.setIconPixmap(pixmap);
+    //instructionBox1.setStyleSheet("font-size:14pt; background-color:#FAEBD7;");
+    instructionBox1.exec();
+
+    QMessageBox instructionBox2;
+    QPixmap pixmap2("Tutorial2.png");
+    instructionBox2.setIconPixmap(pixmap2);
+    //instructionBox2.setStyleSheet("font-size:14pt; background-color:#FAEBD7;");
+    instructionBox2.exec();
+
+    /*QMessageBox instructionBox3;
+    QPixmap pixmap3("Tutorial3.png");
+    instructionBox3.setIconPixmap(pixmap3);
+    //instructionBox3.setStyleSheet("font-size:14pt; background-color:#FAEBD7;");
+    instructionBox3.exec();*/
+
+    QMessageBox instructionBox4;
+    QPixmap pixmap4("Tutorial4.png");
+    instructionBox4.setIconPixmap(pixmap4);
+    //instructionBox4.setStyleSheet("font-size:14pt; background-color:#FAEBD7;");
+    instructionBox4.exec();
+
+   /* QMessageBox instructionBox5;
+    QPixmap pixmap5("Tutorial5.png");
+    instructionBox5.setIconPixmap(pixmap5);
+    //instructionBox5.setStyleSheet("font-size:14pt; background-color:#FAEBD7;");
+    instructionBox5.exec();*/
+
+    QMessageBox instructionBox6;
+    QPixmap pixmap6("Tutorial6.png");
+    instructionBox6.setIconPixmap(pixmap6);
+    //instructionBox6.setStyleSheet("font-size:14pt; background-color:#FAEBD7;");
+    instructionBox6.exec();
+
+    QMessageBox instructionBox7;
+    //instructionBox7.setStyleSheet("font-size:14pt; background-color:#FAEBD7;");
+    instructionBox7.setText("As you resume the video, continue looking for suspicious behaviors, and repeat the process. \nEven if it's a behavior you've checked before, please check it again. Thanks! \n\nNow the instructor will load the videos.\n\nThe first video that will play is a practice video for you to get accustomed to this program. Your input will not be analyzed from this first video.");
+    instructionBox7.exec();
+}
+
+void Player::clickReady() {
+    QMessageBox instructionBox;
+    //instructionBox7.setStyleSheet("font-size:14pt; background-color:#FAEBD7;");
+    instructionBox.setText("Click on the play button when you are ready.");
+    instructionBox.exec();
+}
+
+#endif
